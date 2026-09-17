@@ -1,0 +1,11 @@
+.venv/
+.git/
+.gitignore
+.env
+__pycache__/
+*.pyc
+.kiro/
+deploy/
+docs/
+test_data/
+.DS_Store

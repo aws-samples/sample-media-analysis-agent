@@ -1,0 +1,77 @@
+# macOS / OS metadata
+.DS_Store
+Thumbs.db
+Icon?
+.AppleDouble
+.LSOverride
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# Packaging / build output
+build/
+dist/
+*.egg-info/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Secrets and local configuration — do NOT commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+config.local.*
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# Streamlit local state
+.streamlit/secrets.toml
+
+# Container / deploy scratch
+build.log
+*.tar
+*.tar.gz
+
+# Drawio autosave backups
+.$*.drawio.bkp
+*.drawio.bak
+
+# ASH scan output (keep the config, ignore the results)
+.ash/ash_output/
+.ash/prowler-output/
+
+# Local scratch
+tmp/
+temp/
+scratch/
+*.tmp

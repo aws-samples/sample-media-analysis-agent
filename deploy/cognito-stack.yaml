@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cognito User Pool for Video Analytic Agent
+
+Parameters:
+  AppUrl:
+    Type: String
+    Description: The application URL (ALB DNS or custom domain)
+    Default: http://localhost:8501
+
+  DomainPrefix:
+    Type: String
+    Description: Cognito hosted UI domain prefix (must be globally unique)
+    Default: video-analytic-agent
+
+  AllowSelfSignup:
+    Type: String
+    Description: >-
+      T-06 mitigation. Whether to allow public self-signup on the Cognito
+      user pool. Default 'false' means only administrators can create users
+      (AWS console, CLI, or SDK), and the "Sign Up" tab is hidden in the
+      Streamlit UI. Set to 'true' only if the deployment intentionally
+      accepts registrations from the internet; consider adding a domain
+      allowlist via a PreSignUp Lambda trigger before doing so. Must be
+      supplied identically to the ECS stack's AllowSelfSignup parameter so
+      client and server agree on behaviour. See docs/threat-model.md T-06.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+Conditions:
+  AllowSelfSignupEnabled: !Equals [!Ref AllowSelfSignup, 'true']
+
+Resources:
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: video-analytic-agent-users
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      # MFA enforcement: ON — all users are required to configure a
+      # SOFTWARE_TOKEN_MFA (TOTP) authenticator on their next login.
+      # Existing users without MFA hit an MFA_SETUP challenge; new
+      # users go through setup immediately after signup verification.
+      # Addresses cfn-nag F78 and cdk-nag AwsSolutions-COG2.
+      # Client flow handled in auth.py (_authenticate_user +
+      # _respond_to_mfa_challenge + _handle_mfa_setup).
+      MfaConfiguration: 'ON'
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      # T-06 mitigation: administrator-only user creation by default.
+      # Flip to false (open self-signup) only when the AllowSelfSignup
+      # parameter is explicitly set to 'true' at deploy time. Invite
+      # message template gives an admin-created user a clean first-run:
+      # they receive an email, sign in with the temp password, then set
+      # a permanent password (handled by _show_new_password_form in
+      # auth.py) and complete MFA setup.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: !If [AllowSelfSignupEnabled, false, true]
+        InviteMessageTemplate:
+          EmailSubject: "You've been invited to Video Analytic Agent"
+          EmailMessage: |
+            You have been invited to Video Analytic Agent.
+
+            Sign in with:
+              Username: {username}
+              Temporary password: {####}
+
+            You will be prompted to set a permanent password and
+            configure two-factor authentication on first sign-in.
+      # Strong password policy per cdk-nag AwsSolutions-COG1:
+      # 12-char minimum, all four character categories required, and
+      # temporary/reset passwords expire in 3 days. Existing users
+      # continue to authenticate with their current passwords; the new
+      # policy applies on next password change or reset.
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 3
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: video-analytic-agent-web
+      UserPoolId: !Ref UserPool
+      # This is a public SPA; a client secret cannot be safely stored in the browser.
+      # OAuth PKCE + Cognito user password flow is used instead. Not a hardcoded secret.
+      GenerateSecret: false  # pragma: allowlist secret
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - !Ref AppUrl
+      LogoutURLs:
+        - !Ref AppUrl
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref DomainPrefix
+      UserPoolId: !Ref UserPool
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref UserPoolClient
+
+  CognitoDomain:
+    Description: Cognito Hosted UI domain
+    Value: !Sub '${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+
+  LoginUrl:
+    Description: Direct login URL
+    Value: !Sub 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=code&scope=openid+email+profile&redirect_uri=${AppUrl}'
+
+  AllowSelfSignup:
+    Description: >-
+      Whether self-signup is enabled in this Cognito user pool. Pass this
+      exact value to the ECS stack's AllowSelfSignup parameter so the
+      client hides/shows the Sign Up tab consistently.
+    Value: !Ref AllowSelfSignup

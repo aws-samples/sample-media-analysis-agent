@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infrastructure for Video Object Locator - S3 bucket, SNS topic, and IAM role for Rekognition Video
+
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: video-object-locator
+    Description: Prefix for resource naming
+
+Resources:
+  # Access logs bucket for the video bucket (CKV_AWS_18). Kept as a
+  # separate bucket per AWS best practice (avoid logging into the same
+  # bucket that's being logged).
+  VideoBucketAccessLogs:
+    Type: AWS::S3::Bucket
+    Metadata:
+      # This is the log-destination bucket for VideoBucket, so it cannot
+      # satisfy the access-logging rules: pointing it at itself is the
+      # recursion loop AWS advises against, and pointing it at a further
+      # bucket only moves the finding to a new terminal destination.
+      #
+      # Suppressed for both scanners here, in the template, so the
+      # rationale travels with the resource for ANY scan. The repo-level
+      # .ash/.ash.yaml carries the same CKV_AWS_18 entry for ASH runs.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: 'Access-log destination bucket must not have its own access logging (would create a logging recursion loop).'
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: 'This IS the S3 server-access-log destination bucket for VideoBucket. Enabling access logging on it would create a recursion loop; chaining to another bucket only relocates the finding. VideoBucket itself has access logging enabled.'
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${AWS::AccountId}-${AWS::Region}-access-logs'
+      # Versioning enabled (CKV_AWS_21). S3 writes every server
+      # access-log object under a unique key, so this produces almost no
+      # noncurrent versions — negligible cost, and it makes the audit
+      # trail resistant to accidental overwrite or deletion. Noncurrent
+      # versions expire on the same 30-day cadence as current ones.
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs30d
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  VideoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${AWS::AccountId}-${AWS::Region}'
+      # Versioning enabled (CKV_AWS_21). Noncurrent versions expire on
+      # the same 1-day cadence as current versions to keep storage
+      # bounded — this is a short-lived processing bucket, not an
+      # archive.
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAllObjects24h
+            Status: Enabled
+            ExpirationInDays: 1
+            NoncurrentVersionExpirationInDays: 1
+      LoggingConfiguration:
+        DestinationBucketName: !Ref VideoBucketAccessLogs
+        LogFilePrefix: video-bucket-access/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Grants Amazon Bedrock Data Automation (BDA) permission to read
+  # uploaded videos from and write processed output to VideoBucket.
+  # Previously applied out-of-band via `aws s3api put-bucket-policy`;
+  # that pattern is fragile because CFN stack updates can silently
+  # drop out-of-band bucket policies, breaking BDA until manually
+  # re-applied. Managing it in CFN makes the policy reassert on every
+  # stack update. The aws:SourceAccount condition prevents confused-
+  # deputy attacks (BDA calls from other AWS accounts using this
+  # bucket as a target).
+  VideoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VideoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Defense-in-depth: reject any request that reaches S3 over
+          # non-TLS transport, regardless of caller identity. Applies
+          # to all principals, so it also constrains the Bedrock BDA
+          # allow below.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${VideoBucket}'
+              - !Sub 'arn:aws:s3:::${VideoBucket}/*'
+            Condition:
+              Bool:
+                # Unquoted boolean — canonical AWS form and the shape the
+                # cfn-guard S3_BUCKET_SSL_REQUESTS_ONLY rule matches on.
+                'aws:SecureTransport': false
+          - Sid: AllowBedrockBDAReadWrite
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+            Resource:
+              - !Sub 'arn:aws:s3:::${VideoBucket}'
+              - !Sub 'arn:aws:s3:::${VideoBucket}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Bucket policy for the log-destination bucket. cfn-nag W51 flags
+  # this bucket for having no policy at all — the DenyInsecureTransport
+  # statement below both satisfies the check and adds real value
+  # (log data in transit is always TLS-protected). S3 server access
+  # logging writes to this bucket via the logging.s3.amazonaws.com
+  # service principal, which continues to work over TLS.
+  VideoBucketAccessLogsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VideoBucketAccessLogs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${VideoBucketAccessLogs}'
+              - !Sub 'arn:aws:s3:::${VideoBucketAccessLogs}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  RekognitionNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectPrefix}-rekognition-notifications'
+      # SNS encryption (CKV_AWS_26). Uses the AWS-managed KMS key for
+      # SNS which is free — no dedicated CMK required for this
+      # notification-only topic.
+      KmsMasterKeyId: alias/aws/sns
+
+  RekognitionServiceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      # cfn-nag W28 flags the explicit RoleName because it blocks
+      # in-place replacement. The name is intentional: it produces a
+      # predictable ARN suffix that operators can locate in the IAM
+      # console and that the deploy script exports via
+      # RekognitionRoleArn. Removing the name would force role
+      # replacement on the next infra deploy — the new ARN would then
+      # need to propagate through the ECS stack parameter, requiring
+      # a same-run redeploy of both stacks. Left as-is with a
+      # documented reason.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: 'Explicit RoleName intentional — replacement would change the role ARN and require a same-run redeploy of the ECS stack that consumes RekognitionRoleArn. Documented residual.'
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-rekognition-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rekognition.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RekognitionSNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref RekognitionNotificationTopic
+
+Outputs:
+  BucketName:
+    Description: S3 bucket for video uploads
+    Value: !Ref VideoBucket
+  SNSTopicArn:
+    Description: SNS topic ARN for Rekognition job notifications
+    Value: !Ref RekognitionNotificationTopic
+  RekognitionRoleArn:
+    Description: IAM role ARN for Rekognition Video
+    Value: !GetAtt RekognitionServiceRole.Arn

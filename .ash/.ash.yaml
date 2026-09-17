@@ -1,0 +1,31 @@
+# ASH v3 configuration for the slim Video Analytic Agent
+# Documentation: https://awslabs.github.io/automated-security-helper/
+
+global_settings:
+  suppressions:
+    # ── CKV_AWS_18 (S3 access logging) ────────────────────────────────
+    #
+    # Applies ONLY to the two access-log destination buckets. Every
+    # bucket that holds application data already has access logging
+    # enabled: VideoBucket logs to VideoBucketAccessLogs with the
+    # video-bucket-access/ prefix (cfn-video-locator-infra.yaml).
+    #
+    # A log-destination bucket cannot satisfy this rule. Pointing it at
+    # itself is the recursion loop AWS explicitly advises against —
+    # writing each access-log object generates another access-log
+    # entry. Pointing it at a further bucket only moves the finding,
+    # because that bucket then becomes the untracked terminal
+    # destination. The chain has to end somewhere, and it ends here.
+    #
+    # Both buckets already carry the matching cfn-nag W35 suppression
+    # inline via resource Metadata, with the same rationale.
+    #
+    # Access to these buckets is not unaudited: S3 data events for them
+    # can be captured in CloudTrail, which is the appropriate control
+    # for a log-archive bucket.
+    - rule_id: 'CKV_AWS_18'
+      path: 'cfn-video-locator-infra.yaml'
+      reason: 'VideoBucketAccessLogs is the S3 server-access-log destination for VideoBucket. Enabling access logging on it would create a logging recursion loop; chaining to another bucket only relocates the finding to a new terminal destination. VideoBucket itself HAS access logging enabled. Matches the inline cfn-nag W35 suppression on the resource.'
+    - rule_id: 'CKV_AWS_18'
+      path: 'deploy/ecs-fargate-stack.yaml'
+      reason: 'ALBAccessLogsBucket is the destination for ALB access logs. Same rationale as VideoBucketAccessLogs: a log-destination bucket cannot log to itself without recursion, and chaining to another bucket only moves the finding. Matches the inline cfn-nag W35 suppression on the resource.'

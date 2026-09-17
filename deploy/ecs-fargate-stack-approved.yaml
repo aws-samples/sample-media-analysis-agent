@@ -1,0 +1,1233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Video Analytic Agent - ECS Fargate + ALB Deployment
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: ECR image URI
+
+  S3Bucket:
+    Type: String
+    Description: S3 bucket for file storage
+
+  AwsRegion:
+    Type: String
+    Default: us-east-1
+
+  ModelId:
+    Type: String
+    Description: >
+      Bedrock model or cross-region inference profile ID. The default is a
+      us.* cross-region inference profile, which requires IAM permission
+      on BOTH the inference-profile ARN and the foundation-model ARN in
+      every region the profile can route to — see the TaskRole policy.
+
+      Was us.anthropic.claude-sonnet-4-20250514-v1:0, changed after
+      Anthropic marked that model LEGACY: Bedrock refuses legacy models
+      for accounts that have not invoked them in the last 30 days, which
+      surfaces at runtime as a ResourceNotFoundException rather than at
+      deploy time. Any pinned model version will eventually reach the
+      same state, so verify with
+      `aws bedrock list-foundation-models --by-provider anthropic`
+      and check modelLifecycle.status before deploying.
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+
+  SnsTopicArn:
+    Type: String
+    Description: SNS Topic ARN for Rekognition notifications
+    Default: 'none'
+
+  RekognitionRoleArn:
+    Type: String
+    Description: IAM Role ARN for Rekognition video analysis
+    Default: 'none'
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  CognitoUserPoolId:
+    Type: String
+    Description: >-
+      Cognito User Pool ID. REQUIRED for ECS deployments. Leaving this empty
+      causes the container to fail at startup (T-01 mitigation). The "no auth"
+      opt-out via ALLOW_INSECURE_LOCAL is only reachable when Streamlit is
+      bound to a loopback address, which is incompatible with ALB reachability.
+      See docs/threat-model.md T-01.
+    Default: ''
+
+  CognitoClientId:
+    Type: String
+    Description: >-
+      Cognito App Client ID. REQUIRED for ECS deployments. Must be set together
+      with CognitoUserPoolId; partial configuration causes the container to
+      fail at startup.
+    Default: ''
+
+  CognitoDomain:
+    Type: String
+    Description: >-
+      Cognito Hosted UI domain (e.g., myapp.auth.us-east-1.amazoncognito.com).
+      Only required if APP_URL uses https:// and Hosted UI OAuth flow is
+      desired; direct USER_PASSWORD_AUTH flow does not need it.
+    Default: ''
+
+  AllowSelfSignup:
+    Type: String
+    Description: >-
+      T-06 mitigation. Whether the Cognito user pool allows public
+      self-signup. Must match the AllowSelfSignup output of the
+      cognito-stack so the app UI and the user pool agree. Default
+      'false' hides the Sign Up tab in the Streamlit UI and shows
+      admin-invite guidance instead. See docs/threat-model.md T-06.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  AppUrl:
+    Type: String
+    Description: >
+      Application URL used for the Cognito callback and for auth mode
+      selection in auth.py. With CloudFront in front of the internal
+      ALB this is always https://<distribution-domain>, which makes
+      auth.py select the Cognito Hosted UI OAuth code flow — the
+      application itself never handles the user's password. Populated
+      automatically by deploy-ecs.sh on its second pass.
+      See docs/threat-model.md T-05.
+    Default: ''
+
+  CloudFrontPrefixListId:
+    Type: String
+    Description: >
+      T-05 mitigation. ID of the AWS-managed prefix list
+      com.amazonaws.global.cloudfront.origin-facing, used as the ONLY
+      ingress source on the ALB security group. Because the ALB is
+      Scheme=internal in private subnets, this is what permits the
+      CloudFront VPC origin to reach it. Prefix list IDs are
+      region-specific, so deploy-ecs.sh resolves this at deploy time
+      via `ec2 describe-managed-prefix-lists`. Intentionally has no
+      default: an unset value must fail the deploy rather than
+      silently produce an unreachable ALB.
+      See docs/threat-model.md T-05.
+    AllowedPattern: '^pl-[0-9a-f]+$'
+    ConstraintDescription: Must be a managed prefix list ID (pl-xxxxxxxx).
+
+  UploadQuotaGb:
+    Type: Number
+    Description: >
+      T-07 security control. Per-user upload staging allowance, in GB. This is
+      what makes disk exhaustion self-limiting: a user can fill their own
+      allowance but not another user's, so one user cannot crash the task and
+      destroy everyone else's in-flight analysis. Enforced in the application
+      against the per-user staging directory. Keyed per user, not per session,
+      so multiple browser tabs share one allowance.
+    Default: 15
+    MinValue: 1
+
+  TaskEphemeralStorageGb:
+    Type: Number
+    Description: >
+      CAPACITY PREREQUISITE, not a security control — keep the distinction in
+      mind when reviewing. Total ephemeral disk for the task, shared by every
+      concurrent session on it.
+
+      Size it as:  (max concurrent users per task x UploadQuotaGb) + 5 GB
+      reserve for the container image and OS. The default 100 GB supports 6
+      concurrent users at the 15 GB default quota.
+
+      Under-provisioning degrades availability for legitimate users — later
+      arrivals find the disk already committed — but it does NOT reintroduce
+      the security threat, because UploadQuotaGb still bounds each user
+      individually. Fargate permits 21 to 200 GiB, so 200 is the ceiling
+      (13 users at 15 GB). Beyond that, scale out tasks.
+    Default: 100
+    MinValue: 21
+    MaxValue: 200
+
+  FlowLogsTrafficType:
+    Type: String
+    Description: >
+      VPC Flow Logs traffic capture scope. ALL captures accepted and
+      rejected traffic (full visibility, higher volume). REJECT captures
+      only blocked traffic (cheaper, still surfaces probe/scan activity).
+      ACCEPT captures only allowed traffic.
+    Default: ALL
+    AllowedValues:
+      - ALL
+      - ACCEPT
+      - REJECT
+
+  FlowLogsRetentionInDays:
+    Type: Number
+    Description: >
+      Retention (in days) for the VPC Flow Logs CloudWatch log group.
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+
+Mappings:
+  # AWS ELB account IDs by region (used by the ALB access-logs bucket
+  # policy). These are the accounts that own the ELB service in each
+  # region and must be granted s3:PutObject to deliver access logs.
+  # Reference: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html
+  ELBAccountByRegion:
+    us-east-1: {AccountId: '127311923021'}
+    us-east-2: {AccountId: '033677994240'}
+    us-west-1: {AccountId: '027434742980'}
+    us-west-2: {AccountId: '797873946194'}
+    eu-west-1: {AccountId: '156460612806'}
+    eu-central-1: {AccountId: '054676820928'}
+    ap-southeast-1: {AccountId: '114774131450'}
+    ap-southeast-2: {AccountId: '783225319266'}
+    ap-northeast-1: {AccountId: '582318560864'}
+    ap-northeast-2: {AccountId: '600734575887'}
+
+Conditions:
+  HasRekognitionRole: !Not [!Equals [!Ref RekognitionRoleArn, 'none']]
+  # T-13: only include sns:Publish in the TaskRole policy when a real
+  # topic ARN was passed. Default 'none' means the statement is omitted
+  # entirely rather than trying to publish to a non-ARN value.
+  HasSnsTopic: !Not [!Equals [!Ref SnsTopicArn, 'none']]
+
+Resources:
+
+  # ── VPC ──────────────────────────────────────────────────────────────
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: video-analytic-agent-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Subnets are "public" via routing (0.0.0.0/0 -> IGW in
+  # PublicRouteTable) but MapPublicIpOnLaunch is false: any new ENI
+  # must explicitly request a public IP. The Fargate service already
+  # opts in via NetworkConfiguration.AssignPublicIp=ENABLED, and the
+  # ALB gets its own service-managed public IPs, so this change is
+  # runtime-neutral. Closes cfn-nag CFN_NAG_W33.
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: video-analytic-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: video-analytic-public-2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Private subnets (internal ALB + CloudFront VPC origin ENI) ────────
+  #
+  # T-05 mitigation. These subnets host the internal ALB and the
+  # service-managed elastic network interface that CloudFront creates
+  # for the VPC origin. They are private in the strict sense: the
+  # PrivateRouteTable below has NO 0.0.0.0/0 route, so nothing in them
+  # can reach — or be reached from — the internet directly. CloudFront
+  # is therefore the only path to the application.
+  #
+  # Scope note: the ECS tasks deliberately remain in the PUBLIC subnets
+  # with AssignPublicIp=ENABLED. Fargate needs outbound reach to pull
+  # the image from ECR and to call Bedrock / Rekognition / Transcribe /
+  # S3 / STS / CloudWatch Logs / Cognito, all of which are public
+  # endpoints. Doing that from a private subnet requires either a NAT
+  # gateway (~$32/mo per AZ + data processing) or ~6-7 interface VPC
+  # endpoints (~$50-100/mo), which is the accepted residual tracked as
+  # T-18. Nothing inbound reaches the tasks regardless: ECSSecurityGroup
+  # admits only ALBSecurityGroup on tcp/8501.
+  #
+  # VPC origin prerequisites satisfied here: the VPC already has an
+  # internet gateway attached (required by CloudFront to mark the VPC
+  # as internet-reachable, though it is NOT used to route origin
+  # traffic), and each private subnet has ample free IPv4 addresses for
+  # the service-managed ENI.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: video-analytic-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: video-analytic-private-2
+
+  # No default route. Intra-VPC traffic works via the implicit local
+  # route, which is all the ALB needs to reach the ECS tasks.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: video-analytic-private-rt
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ── VPC Flow Logs ────────────────────────────────────────────────────
+  # Captures IP traffic to/from the VPC for security monitoring
+  # (CFN_NAG_W60). Delivered to CloudWatch Logs, encrypted with the same
+  # customer-managed KMS key used by the ECS log group. TrafficType is
+  # controlled via the FlowLogsTrafficType parameter (default ALL).
+
+  FlowLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vpc/flowlogs/video-analytic-agent
+      RetentionInDays: !Ref FlowLogsRetentionInDays
+      KmsKeyId: !GetAtt LogGroupKmsKey.Arn
+
+  FlowLogsDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogsDelivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !GetAtt FlowLogsLogGroup.Arn
+                  - !Sub '${FlowLogsLogGroup.Arn}:*'
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: !Ref FlowLogsTrafficType
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogsLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsDeliveryRole.Arn
+      Tags:
+        - Key: Name
+          Value: video-analytic-agent-vpc-flowlogs
+
+  # ── Security Groups ──────────────────────────────────────────────────
+  # ALB and ECS SGs cross-reference each other (ALB egress → ECS SG on
+  # 8501; ECS ingress from ALB SG). To avoid a CFN circular dependency,
+  # the ECS ingress rule that references ALBSecurityGroup is defined as
+  # a standalone AWS::EC2::SecurityGroupIngress resource below rather
+  # than inline on ECSSecurityGroup.
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB Security Group - allow HTTP from CloudFront only
+      VpcId: !Ref VPC
+      # T-05: the only permitted ingress is the CloudFront managed
+      # prefix list. The ALB is Scheme=internal in private subnets with
+      # no route to an internet gateway, so browser clients never reach
+      # it directly — they reach the CloudFront distribution, which
+      # forwards over its service-managed VPC origin ENI.
+      #
+      # This replaces the previous `CidrIp: !Ref AllowedCidr` rule,
+      # which was actively broken: deploy-ecs.sh set AllowedCidr to the
+      # deployer's public /32, a value that can never match traffic
+      # arriving at an internal ALB, so the dev path was unreachable.
+      #
+      # Tighter alternative for production: after the first deploy,
+      # CloudFront creates a service-managed security group named
+      # CloudFront-VPCOrigins-Service-SG. Referencing that instead of
+      # the prefix list narrows ingress from "any CloudFront
+      # distribution" to "your distributions only". It cannot be used
+      # here because it does not exist until the VPC origin is created,
+      # so it is a post-deploy hardening step rather than a
+      # single-pass template option. Tracked in the README production
+      # hardening checklist.
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+          Description: HTTP from CloudFront origin-facing prefix list only
+      # ALB egress restricted to ECS tasks on the Streamlit port only
+      # (closes cfn-nag W40 + W5). The ALB never initiates connections
+      # anywhere else — forwarded traffic and health checks all go to
+      # ECS tasks on tcp/8501.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          DestinationSecurityGroupId: !Ref ECSSecurityGroup
+          Description: ALB to ECS tasks on Streamlit port (forward and health)
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      # T-18: egress to 0.0.0.0/0 on tcp/443 is required because AWS
+      # API endpoints (Bedrock, S3, Rekognition, Transcribe, STS, CW
+      # Logs, Cognito) are on the public internet. Closing W5 fully
+      # requires VPC endpoints per AWS service, which adds meaningful
+      # cost and template complexity (~$50-100/mo per region for the
+      # 6-7 endpoints needed). Accepted as residual for the reference
+      # architecture; called out as a production-hardening item in
+      # docs/threat-model.md T-18 and (once written) the README
+      # "Security Considerations for Production" section.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: 'T-18: 0.0.0.0/0 egress on tcp/443 required for AWS API endpoints (public). Closing fully requires VPC endpoints per service, deferred as a production-hardening item — see docs/threat-model.md T-18. Protocol wildcard already closed (tcp/443 only, W40 addressed).'
+    Properties:
+      GroupDescription: ECS Tasks Security Group
+      VpcId: !Ref VPC
+      # Ingress from ALB is defined below as a standalone
+      # AWS::EC2::SecurityGroupIngress resource to avoid a circular
+      # dependency between this SG and ALBSecurityGroup.
+      #
+      # ECS task egress: HTTPS-only to reach AWS API endpoints
+      # (Bedrock, S3, Rekognition, Transcribe, STS, CloudWatch Logs,
+      # Cognito). Protocol narrowed from -1 to tcp/443, closing
+      # cfn-nag W40. CIDR remains 0.0.0.0/0 because AWS API endpoints
+      # are public — closing W5 requires VPC endpoints (tracked as
+      # T-18 production-hardening item). External media downloads are
+      # not supported by this application.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS API endpoints (Path B endpoints TBD)
+
+  # Cross-reference rule: allow ALB SG to reach ECS tasks on 8501.
+  # Defined here (not inline on ECSSecurityGroup) to break the
+  # circular dependency between the two security groups.
+  ECSIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8501
+      ToPort: 8501
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Description: Streamlit port from ALB security group only
+
+  # ── ALB ──────────────────────────────────────────────────────────────
+
+  # ALB access-logs destination bucket (CKV_AWS_91). Uses SSE-S3
+  # (AES256) — ALB access logs do NOT support customer-managed KMS
+  # keys, only S3-managed encryption. BucketOwnerEnforced avoids ACLs.
+  ALBAccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      # Same log-destination recursion rationale as VideoBucketAccessLogs
+      # in cfn-video-locator-infra.yaml: a bucket that receives access
+      # logs cannot log to itself without looping, and chaining to a
+      # further bucket only moves the finding.
+      #
+      # Suppressed for both scanners here, in the template, so the
+      # rationale travels with the resource for ANY scan. The repo-level
+      # .ash/.ash.yaml carries the same CKV_AWS_18 entry for ASH runs.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: 'Access-log destination bucket must not have its own access logging (would create a logging recursion loop).'
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: 'This IS the ALB access-log destination bucket. Enabling S3 access logging on it would create a recursion loop; chaining to another bucket only relocates the finding to a new terminal destination.'
+    Properties:
+      BucketName: !Sub 'video-analytic-alb-logs-${AWS::AccountId}-${AWS::Region}'
+      # Versioning enabled (CKV_AWS_21). ALB writes every log object
+      # under a unique key, so this produces almost no noncurrent
+      # versions in practice — the cost is negligible and it makes the
+      # audit trail resistant to accidental overwrite or deletion.
+      # Noncurrent versions expire on the same 30-day cadence as current
+      # ones so storage stays bounded.
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs30d
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  # ALB access-logs bucket policy. Grants the region-specific ELB
+  # service account s3:PutObject permission — this is the
+  # officially documented pattern that works in all regions.
+  # The region-specific account IDs are looked up from
+  # Mappings.ELBAccountByRegion.
+  ALBAccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ALBAccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Defense-in-depth: reject any request that reaches S3 over
+          # non-TLS transport, regardless of principal. The delivery.
+          # logs.amazonaws.com and ELB service principals both use
+          # TLS, so this does not affect legitimate log delivery.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ALBAccessLogsBucket.Arn
+              - !Sub '${ALBAccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                # Unquoted boolean, which is the canonical form AWS uses
+                # and the exact shape the cfn-guard
+                # S3_BUCKET_SSL_REQUESTS_ONLY rule matches on. A quoted
+                # 'false' is functionally identical to IAM but does not
+                # match the rule's expected pattern.
+                'aws:SecureTransport': false
+          - Sid: AllowELBAccountPutObject
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - 'arn:aws:iam::${ELBAccount}:root'
+                - ELBAccount: !FindInMap [ELBAccountByRegion, !Ref AWS::Region, AccountId]
+            Action: s3:PutObject
+            Resource: !Sub '${ALBAccessLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+          - Sid: AllowLogDeliveryGetBucketAcl
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ALBAccessLogsBucket.Arn
+          - Sid: AllowLogDeliveryPutObject
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ALBAccessLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: ALBAccessLogsBucketPolicy
+    Metadata:
+      # cfn-nag W28 flags the explicit Name property because it blocks
+      # in-place replacement. The name is intentional: it produces a
+      # stable ALB DNS prefix and predictable console navigation for
+      # operators. Removing it would force ALB replacement on next
+      # deploy, which would change the DNS name and break the Cognito
+      # callback URL configured via the AppUrl parameter. If ALB
+      # replacement ever becomes necessary, drop the Name property in
+      # a controlled maintenance window and update AppUrl + Cognito
+      # callback in the same change set.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: 'Explicit ALB name intentional — replacement would change ALB DNS and require Cognito callback URL update. Documented residual.'
+    Properties:
+      Name: video-analytic-alb
+      # T-05 mitigation: origin cloaking. The ALB is unconditionally
+      # internal and sits in private subnets with no route to an
+      # internet gateway, so the "internet-facing + plaintext HTTP"
+      # combination is not reachable by construction rather than by
+      # parameter discipline.
+      #
+      # This replaces an earlier conditional scheme that flipped to
+      # internet-facing when an ACM certificate was supplied. That
+      # design made public access depend on owning a domain and a
+      # certificate, and its no-certificate path was unreachable.
+      # CloudFront now terminates TLS with its free, publicly trusted
+      # *.cloudfront.net certificate, so no ACM certificate is needed
+      # for public HTTPS access.
+      #
+      # Confidentiality of the remaining hop: CloudFront reaches this
+      # listener over HTTP, but that traffic crosses the AWS network to
+      # a service-managed ENI inside our own VPC, never the public
+      # internet. End-to-end TLS would require a custom domain plus an
+      # ACM certificate on both CloudFront and the ALB, since a
+      # publicly trusted certificate cannot be issued for an
+      # *.elb.amazonaws.com name. Documented residual.
+      # See docs/threat-model.md T-05.
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '3600'
+        # Drop HTTP headers with non-ASCII characters or invalid names
+        # before they reach the backend (CKV_AWS_131).
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        # ALB access logs to the dedicated logs bucket (CKV_AWS_91).
+        # No custom s3.prefix — ALB writes to the standard
+        # AWSLogs/<account>/... path which our bucket policy grants.
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref ALBAccessLogsBucket
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: video-analytic-tg
+      Port: 8501
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /_stcore/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  # ── ALB Listener ─────────────────────────────────────────────────────
+  # A single HTTP:80 listener forwarding to the target group. There is
+  # no HTTPS listener and no HTTP-to-HTTPS redirect, because viewer TLS
+  # is terminated at CloudFront using its *.cloudfront.net certificate
+  # and the distribution's ViewerProtocolPolicy is redirect-to-https.
+  # This listener is only reachable from the CloudFront VPC origin ENI
+  # (internal ALB, private subnets, prefix-list-scoped security group).
+  #
+  # Kept as logical ID 'ALBListener' (not renamed) so CFN treats stack
+  # updates as in-place modification rather than delete-and-recreate,
+  # avoiding a port 80 downtime gap.
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Metadata:
+      # cfn-nag W56 / Checkov CKV_AWS_2+CKV_AWS_103 fire on Protocol:
+      # HTTP. Accepted here: the listener is not internet-reachable, and
+      # the client-facing transport IS TLS — enforced by CloudFront
+      # rather than by the ALB. Terminating TLS a second time at the ALB
+      # would require a publicly trusted certificate for an
+      # *.elb.amazonaws.com name, which cannot be issued. Mirrors the
+      # suppressions documented in .ash/.ash.yaml.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W56
+            reason: 'T-05: HTTP listener is internal-only, reachable solely from the CloudFront VPC origin ENI. Viewer TLS is terminated at CloudFront (ViewerProtocolPolicy redirect-to-https). A publicly trusted cert cannot be issued for *.elb.amazonaws.com, so ALB-side TLS requires a custom domain — documented residual.'
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── CloudFront (sole public entry point) ─────────────────────────────
+  #
+  # T-05 mitigation. CloudFront terminates viewer TLS with its free,
+  # publicly trusted *.cloudfront.net certificate and forwards to the
+  # internal ALB over a service-managed VPC origin ENI. No ACM
+  # certificate, no custom domain, and no public ALB are required.
+  #
+  # Cache and origin-request policies are declared explicitly rather
+  # than referencing the AWS managed CachingDisabled / AllViewer
+  # policies by GUID. Slightly more YAML, but a reader can see exactly
+  # what is forwarded and why, which matters for a reference
+  # architecture.
+
+  # Streamlit is entirely dynamic and its transport is a long-lived
+  # WebSocket, so there is nothing safe to cache. A cached response
+  # here would also be a cross-tenant data leak: pages are rendered
+  # per authenticated session.
+  CloudFrontCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub 'video-analytic-no-cache-${AWS::Region}'
+        Comment: Caching disabled - Streamlit renders per-session dynamic content
+        MinTTL: 0
+        MaxTTL: 0
+        DefaultTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          # Compression is left off so this policy stays consistent with
+          # DefaultCacheBehavior.Compress. With caching disabled the
+          # benefit would be on-the-fly only, and Streamlit's own
+          # Tornado server already compresses its static bundle.
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  # allViewer is what makes the Streamlit WebSocket work: it forwards
+  # the Upgrade / Connection / Sec-WebSocket-* headers that the
+  # /_stcore/stream handshake depends on. Cookies must be forwarded for
+  # the ALB stickiness cookie and the Streamlit session cookie; query
+  # strings must be forwarded for the Cognito Hosted UI OAuth
+  # ?code=... callback. Dropping any of the three produces the same
+  # unhelpful symptom: the page loads, then hangs indefinitely.
+  CloudFrontOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub 'video-analytic-all-viewer-${AWS::Region}'
+        Comment: Forward all viewer headers, cookies and query strings (WebSocket + OAuth callback)
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allViewer
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  # The VPC origin is what lets CloudFront reach an ALB that has no
+  # public IP. CloudFront provisions a service-managed ENI into the
+  # private subnets and routes over the AWS network. OriginProtocolPolicy
+  # is http-only because a publicly trusted certificate cannot be
+  # issued for an *.elb.amazonaws.com name; see the ALB comment.
+  CloudFrontVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: video-analytic-vpc-origin
+        # Ref on an ELBv2 LoadBalancer returns its ARN.
+        Arn: !Ref ApplicationLoadBalancer
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          # Using the free default *.cloudfront.net certificate pins the
+          # viewer-side MinimumProtocolVersion to TLSv1; the property is
+          # rejected by CloudFront unless a custom ACM certificate with
+          # SNI is attached. Raising it to TLSv1.2_2021 therefore
+          # requires buying a domain and issuing a certificate, which
+          # would reintroduce exactly the prerequisite this design set
+          # out to remove. Accepted residual, recorded in
+          # docs/threat-model.md T-05 and the README hardening list.
+          - id: W70
+            reason: 'T-05: MinimumProtocolVersion cannot be set while CloudFrontDefaultCertificate is true. Raising it requires a custom domain + ACM cert. Accepted residual, documented in docs/threat-model.md T-05.'
+          # CloudFront-side access logging is not enabled. Request-level
+          # audit coverage is not lost: every viewer request is forwarded
+          # to the ALB, whose access logs are already enabled to
+          # ALBAccessLogsBucket, and CloudFront populates X-Forwarded-For
+          # with the true client IP, which the ALB records. What is
+          # missing is edge-side visibility into requests CloudFront
+          # rejects before they reach the origin. Enabling CloudFront
+          # standard logging is on the README hardening checklist.
+          - id: W10
+            reason: 'Request-level logging is covered by ALB access logs (already enabled), including true client IP via X-Forwarded-For. Edge-side logging is a README hardening item. Also note AWS WAF is not attached: access requires an admin-provisioned Cognito account (T-06), so the surface is authenticated rather than anonymous.'
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: video-analytic-agent - sole public entry point to the internal ALB
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        # PriceClass_100 (NA + EU) keeps cost down for a reference
+        # deployment. Widen if your users are elsewhere.
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: internal-alb-vpc-origin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt CloudFrontVpcOrigin.Id
+              # 120s is the maximum CloudFront allows. Video analysis
+              # calls to Bedrock and Rekognition can be slow; anything
+              # genuinely long-running is already handed to
+              # background_processor.py, but the headroom avoids 504s on
+              # the synchronous path.
+              OriginReadTimeout: 120
+              # Maximum (300s). Keeps the WebSocket connection from
+              # being torn down during idle periods in a session.
+              OriginKeepaliveTimeout: 300
+        DefaultCacheBehavior:
+          TargetOriginId: internal-alb-vpc-origin
+          # Viewers that arrive over HTTP are redirected to HTTPS, which
+          # is what makes the end-to-end browser transport encrypted
+          # despite the ALB listener being plaintext.
+          ViewerProtocolPolicy: redirect-to-https
+          # Streamlit issues POSTs for file uploads and OPTIONS
+          # preflights; the WebSocket handshake needs GET.
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: false
+          CachePolicyId: !Ref CloudFrontCachePolicy
+          OriginRequestPolicyId: !Ref CloudFrontOriginRequestPolicy
+        ViewerCertificate:
+          # Free and publicly trusted. This is the whole reason no ACM
+          # certificate is needed for public HTTPS access.
+          CloudFrontDefaultCertificate: true
+
+  # ── ECS ──────────────────────────────────────────────────────────────
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: video-analytic-cluster
+      # Container Insights collects CPU/memory/network metrics per task
+      # into CloudWatch (CKV_AWS_65). Small monthly cost per cluster,
+      # essential for troubleshooting Fargate tasks.
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      # T-13 partial: sns:Publish and bedrock:InvokeModel(WithResponseStream)
+      # are now scoped (see policy below). Remaining Resource: '*' entries
+      # on Rekognition/Transcribe/BDA/ListFoundationModels/GetCallerIdentity
+      # are documented residuals — those AWS APIs do not support resource-
+      # level ARNs per the IAM Service Authorization Reference. Cannot be
+      # scoped further without breaking functionality.
+      # Mirrors AwsSolutions-IAM5 suppression in .ash/.ash.yaml.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: 'T-13: TaskRole retains Resource: * on Rekognition, Transcribe, BDA (InvokeDataAutomationAsync et al.), ListFoundationModels, and sts:GetCallerIdentity because these AWS APIs do not support resource-level ARNs per the IAM Service Authorization Reference. sns:Publish and bedrock:InvokeModel(WithResponseStream) ARE scoped in this template (T-13 partial resolution). See docs/threat-model.md T-13.'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: VideoAnalyticAgentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  # s3:HeadObject is not a real IAM action (cfn-lint W3037).
+                  # HeadObject is authorised by s3:GetObject, already granted
+                  # above, so removing it changes no behaviour.
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3Bucket}'
+                  - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+              # T-13: bedrock:InvokeModel + InvokeModelWithResponseStream.
+              #
+              # The default MODEL_ID is a CROSS-REGION inference profile
+              # ('us.anthropic.claude-sonnet-4-...'). Invoking one requires
+              # two distinct permissions, and this is easy to get wrong:
+              #   1. the inference-profile ARN, which is scoped to this
+              #      account and the deployment region; and
+              #   2. the underlying foundation-model ARN in whichever
+              #      region the profile routed the request to — which is
+              #      NOT necessarily the deployment region.
+              #
+              # An earlier revision scoped BOTH resources to
+              # ${AWS::Region} and asserted in a comment that this covered
+              # cross-region profiles. It did not, and the deployment
+              # failed at runtime with AccessDenied on
+              # 'arn:aws:bedrock:us-east-2::foundation-model/...'.
+              # `aws bedrock get-inference-profile` reports the us.* profiles
+              # fan out to us-east-1, us-east-2 and us-west-2.
+              #
+              # The foundation-model region is therefore wildcarded. Why
+              # that is acceptable: the routing set is AWS-managed and can
+              # change without notice, so enumerating it re-breaks on the
+              # next change; foundation-model ARNs carry no account ID, so
+              # this cannot reach another account's resources; and the
+              # meaningful control remains statement (1), which IS scoped
+              # to this account and region — a caller cannot invoke a model
+              # cross-region except through a profile it is allowed to use.
+              # The residual is cost abuse in other regions, tracked as
+              # T-12. See docs/threat-model.md T-13.
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+              # T-13 documented residual: the BDA (Bedrock Data Automation)
+              # actions and ListFoundationModels do not support resource-
+              # level ARNs; they require Resource: '*' by AWS design.
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeDataAutomationAsync
+                  - bedrock:GetDataAutomationStatus
+                  - bedrock:ListDataAutomationProjects
+                  - bedrock:CreateDataAutomationProject
+                  - bedrock:GetDataAutomationProject
+                  - bedrock:ListFoundationModels
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - rekognition:StartLabelDetection
+                  - rekognition:GetLabelDetection
+                  - rekognition:StartFaceDetection
+                  - rekognition:GetFaceDetection
+                  - rekognition:DetectLabels
+                  - rekognition:DetectFaces
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+                  - transcribe:DeleteTranscriptionJob
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              # T-13: sns:Publish scoped to the deployed topic ARN.
+              # Omitted entirely when SnsTopicArn defaults to 'none'
+              # (no SNS integration), rather than left as a permissive
+              # placeholder. Original wildcard permitted publish to
+              # any topic in the account.
+              - !If
+                - HasSnsTopic
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref SnsTopicArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasRekognitionRole
+                - Effect: Allow
+                  Action:
+                    - iam:PassRole
+                  Resource: !Ref RekognitionRoleArn
+                  Condition:
+                    StringEquals:
+                      iam:PassedToService: rekognition.amazonaws.com
+                - !Ref AWS::NoValue
+
+  # KMS key for CloudWatch Logs encryption (CKV_AWS_158). CloudWatch
+  # Logs only supports customer-managed KMS keys — the AWS-managed key
+  # is not accepted. The key policy grants root full access (so the
+  # account can rotate/delete) and grants the CW Logs service the
+  # ability to use the key when writing to the log group ARN.
+  LogGroupKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'CMK for ${AWS::StackName} CloudWatch log group encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountManagement
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+            # kms:CallerAccount pins the wildcard delegation to callers
+            # from this account. The Principal already scopes to the
+            # account root, which implies same-account calls, so this
+            # is defense-in-depth against subtle trust-policy drift.
+            # It also satisfies the KICS "KMS Key With Vulnerable
+            # Policy" rule (query da905474-...), which fires when a
+            # kms:* Allow statement lacks any Condition block.
+            Condition:
+              StringEquals:
+                'kms:CallerAccount': !Ref AWS::AccountId
+          - Sid: AllowCloudWatchLogsUseOfTheKey
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              # Scope the key's log-service usage to only the two log
+              # groups this stack owns. IAM treats a list value on
+              # ArnEquals as OR — the encryption context must match one
+              # of these ARNs for the service to use the key.
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn':
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/video-analytic-agent'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc/flowlogs/video-analytic-agent'
+
+  LogGroupKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-log-group'
+      TargetKeyId: !Ref LogGroupKmsKey
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/video-analytic-agent
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt LogGroupKmsKey.Arn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: video-analytic-agent
+      Cpu: '2048'
+      Memory: '4096'
+      # T-07 capacity prerequisite. Without this the task inherits the Fargate
+      # default of 20 GB, which three uploads at the maximum file size are
+      # enough to fill. Sized via TaskEphemeralStorageGb — see that parameter
+      # for the formula. This is capacity, NOT the security control; the
+      # per-user quota (UploadQuotaGb) is what bounds an individual user.
+      EphemeralStorage:
+        SizeInGiB: !Ref TaskEphemeralStorageGb
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: video-analytic-agent
+          Image: !Ref ImageUri
+          PortMappings:
+            - ContainerPort: 8501
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AwsRegion
+            - Name: S3_BUCKET
+              Value: !Ref S3Bucket
+            # T-07: per-user staging allowance, enforced in chat_app.py.
+            - Name: UPLOAD_QUOTA_GB
+              Value: !Ref UploadQuotaGb
+            - Name: MODEL_ID
+              Value: !Ref ModelId
+            - Name: SNS_TOPIC_ARN
+              Value: !Ref SnsTopicArn
+            - Name: REKOGNITION_ROLE_ARN
+              Value: !Ref RekognitionRoleArn
+            - Name: COGNITO_USER_POOL_ID
+              Value: !Ref CognitoUserPoolId
+            - Name: COGNITO_CLIENT_ID
+              Value: !Ref CognitoClientId
+            - Name: COGNITO_DOMAIN
+              Value: !Ref CognitoDomain
+            - Name: ALLOW_SELF_SIGNUP
+              Value: !Ref AllowSelfSignup
+            - Name: APP_URL
+              Value: !Ref AppUrl
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AwsRegion
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - python3.11 -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5)" || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: video-analytic-agent
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: video-analytic-agent
+          ContainerPort: 8501
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── Auto Scaling ────────────────────────────────────────────────────
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 3
+      MinCapacity: 1
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: video-analytic-scale-out
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+Outputs:
+  AppUrl:
+    Description: >-
+      Public HTTPS URL of the application. This is the only reachable
+      entry point. Use this value as AppUrl when re-deploying
+      cognito-stack so the Hosted UI callback matches.
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  CloudFrontDistributionId:
+    Description: >-
+      CloudFront distribution ID (useful for cache invalidation and for
+      locating the CloudFront-VPCOrigins-Service-SG security group when
+      applying the post-deploy ALB ingress hardening step).
+    Value: !Ref CloudFrontDistribution
+
+  LoadBalancerDNS:
+    Description: >-
+      Internal ALB DNS name. NOT reachable from the internet — the ALB is
+      Scheme=internal in private subnets with no default route. Resolvable
+      only from inside the VPC. Present for troubleshooting, not for
+      browser access.
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  ClusterName:
+    Description: ECS Cluster name
+    Value: !Ref ECSCluster
